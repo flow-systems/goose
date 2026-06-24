@@ -1,0 +1,26 @@
+[package]
+name = "goose-router"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pluggable cost-saving model routers for goose"
+
+[dependencies]
+goose-providers = { path = "../goose-providers", default-features = false }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+rmcp = { workspace = true }
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+safetensors = "0.7.0"
+ndarray = "0.17.2"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+
+[lints]
+workspace = true

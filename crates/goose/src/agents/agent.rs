@@ -257,6 +257,7 @@ pub struct Agent {
     goal: Mutex<Option<String>>,
     grind: Mutex<Option<String>>,
     pending_steers: Mutex<HashMap<String, VecDeque<Message>>>,
+    cost_savings_router: Option<Arc<dyn goose_router::Router>>,
 }
 
 #[derive(Clone, Debug)]
@@ -383,6 +384,77 @@ impl Agent {
             goal: Mutex::new(None),
             grind: Mutex::new(None),
             pending_steers: Mutex::new(HashMap::new()),
+            cost_savings_router: Self::load_cost_savings_router(),
+        }
+    }
+
+    /// Load a cost-savings router when the mode is enabled via
+    /// `GOOSE_COST_SAVINGS_MODE` (config or env). Returns `None` when disabled
+    /// or when no router bundle/sidecar is available.
+    fn load_cost_savings_router() -> Option<Arc<dyn goose_router::Router>> {
+        let enabled = Config::global()
+            .get_param::<bool>("GOOSE_COST_SAVINGS_MODE")
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let router = goose_router::load_default_router()?;
+        tracing::info!(
+            target: "goose::router",
+            strategy = router.name(),
+            "cost savings mode enabled",
+        );
+        Some(Arc::from(router))
+    }
+
+    /// When cost savings mode is on, score the conversation and swap to the
+    /// provider's fast model for low-complexity turns. Falls back to the
+    /// supplied `model_config` if routing is disabled, fails, or the fast model
+    /// is the same as the main model.
+    async fn apply_cost_savings_routing(
+        &self,
+        provider_name: &str,
+        model_config: goose_providers::model::ModelConfig,
+        conversation: &Conversation,
+    ) -> goose_providers::model::ModelConfig {
+        let Some(router) = self.cost_savings_router.as_ref() else {
+            return model_config;
+        };
+        let Some(decision) = router.route(conversation) else {
+            return model_config;
+        };
+        if !decision.use_fast {
+            tracing::info!(
+                target: "goose::router",
+                strategy = router.name(),
+                complexity = decision.complexity,
+                elapsed_ms = decision.elapsed_ms,
+                "routing turn to main model",
+            );
+            return model_config;
+        }
+
+        match crate::model_config::get_fast_model(provider_name, &model_config).await {
+            Ok(fast) if fast.model_name != model_config.model_name => {
+                tracing::info!(
+                    target: "goose::router",
+                    strategy = router.name(),
+                    complexity = decision.complexity,
+                    elapsed_ms = decision.elapsed_ms,
+                    fast_model = %fast.model_name,
+                    "routing turn to fast model",
+                );
+                fast
+            }
+            Ok(_) => model_config,
+            Err(e) => {
+                tracing::warn!(
+                    target: "goose::router",
+                    "failed to resolve fast model, using main model: {:#}",
+                    e
+                );
+                model_config
+            }
         }
     }
 
@@ -1775,7 +1847,7 @@ impl Agent {
             tool_call_cut_off,
             goose_mode,
             initial_messages,
-            model_config,
+            mut model_config,
         } = context;
 
         if let Some(project_addendum) = self.load_project_instructions(&session).await {
@@ -1786,6 +1858,11 @@ impl Agent {
 
         let provider = self.provider().await?;
         let provider_name = provider.get_name().to_string();
+
+        model_config = self
+            .apply_cost_savings_routing(&provider_name, model_config, &conversation)
+            .await;
+
         let requested_model = model_config.model_name.clone();
         let inference = provider
             .fetch_model_info(&requested_model)
