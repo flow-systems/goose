@@ -313,23 +313,31 @@ fn format_messages_with_options(
         }));
     }
 
-    // Add "cache_control" to the last and second-to-last "user" messages.
-    // During each turn, we mark the final message with cache_control so the conversation can be
-    // incrementally cached. The second-to-last user message is also marked for caching with the
-    // cache_control parameter, so that this checkpoint can read from the previous cache.
+    // Keep the volatile turn-context out of the cached prefix: move it past the breakpoints.
+    relocate_turn_context_to_tail(&mut anthropic_messages);
+
     let mut user_count = 0;
     for message in anthropic_messages.iter_mut().rev() {
-        if message.get(ROLE_FIELD) == Some(&json!(USER_ROLE)) {
-            if let Some(content) = message.get_mut(CONTENT_FIELD) {
-                if let Some(content_array) = content.as_array_mut() {
-                    if let Some(last_content) = content_array.last_mut() {
-                        last_content.as_object_mut().unwrap().insert(
-                            CACHE_CONTROL_FIELD.to_string(),
-                            json!({ TYPE_FIELD: "ephemeral" }),
-                        );
-                    }
-                }
-            }
+        if message.get(ROLE_FIELD) != Some(&json!(USER_ROLE)) {
+            continue;
+        }
+        let Some(content_array) = message
+            .get_mut(CONTENT_FIELD)
+            .and_then(|content| content.as_array_mut())
+        else {
+            continue;
+        };
+        let Some(target) = cache_control_target_index(content_array) else {
+            continue;
+        };
+        if let Some(block) = content_array
+            .get_mut(target)
+            .and_then(|b| b.as_object_mut())
+        {
+            block.insert(
+                CACHE_CONTROL_FIELD.to_string(),
+                json!({ TYPE_FIELD: "ephemeral" }),
+            );
             user_count += 1;
             if user_count >= 2 {
                 break;
@@ -338,6 +346,54 @@ fn format_messages_with_options(
     }
 
     anthropic_messages
+}
+
+/// Move the turn-context block to the tail of the last message, unless that would empty its source.
+fn relocate_turn_context_to_tail(messages: &mut [Value]) {
+    let Some(last) = messages.len().checked_sub(1) else {
+        return;
+    };
+    let source = messages.iter().enumerate().find_map(|(mi, m)| {
+        m.get(CONTENT_FIELD)
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.iter().position(is_turn_context_block))
+            .map(|bi| (mi, bi))
+    });
+    let Some((mi, bi)) = source else {
+        return;
+    };
+    if mi != last
+        && messages[mi]
+            .get(CONTENT_FIELD)
+            .and_then(|c| c.as_array())
+            .map_or(0, |a| a.len())
+            <= 1
+    {
+        return;
+    }
+    let block = messages[mi][CONTENT_FIELD]
+        .as_array_mut()
+        .unwrap()
+        .remove(bi);
+    messages[last][CONTENT_FIELD]
+        .as_array_mut()
+        .unwrap()
+        .push(block);
+}
+
+/// Last non-turn-context block to mark with `cache_control`, or `None` if there is none.
+fn cache_control_target_index(content_array: &[Value]) -> Option<usize> {
+    content_array
+        .iter()
+        .rposition(|block| !is_turn_context_block(block))
+}
+
+fn is_turn_context_block(block: &Value) -> bool {
+    block.get(TYPE_FIELD).and_then(Value::as_str) == Some(TEXT_TYPE)
+        && block
+            .get(TEXT_TYPE)
+            .and_then(Value::as_str)
+            .is_some_and(crate::conversation::is_turn_context_text)
 }
 
 fn anthropic_flavored_input_schema(input_schema: Arc<JsonObject>) -> Arc<JsonObject> {
